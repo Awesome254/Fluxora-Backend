@@ -1,10 +1,17 @@
 import type { Request, Response, NextFunction } from 'express';
 import { httpRequestsTotal, httpRequestDurationSeconds } from '../metrics.js';
+import { normalizeRouteLabel } from '../metrics/cardinality.js';
 
 /**
  * Normalise the matched route so cardinality stays bounded.
- * Falls back to the raw path only when no Express route was matched,
- * which keeps the label set predictable for Prometheus.
+ *
+ * Prefers the Express route template when available. Falls back to the raw
+ * path only after running it through {@link normalizeRouteLabel}, which
+ * buckets UUIDs, numeric ids, Stellar addresses, and other high-cardinality
+ * segments so path parameters cannot grow the Prometheus series set without
+ * limit.
+ *
+ * @see docs/observability/metric-cardinality.md
  */
 export function resolveRoute(req: Request): string {
   const raw = req.route?.path
@@ -13,7 +20,18 @@ export function resolveRoute(req: Request): string {
 
   // Collapse trailing slash to keep label cardinality predictable,
   // but preserve the bare root path "/".
-  return raw.length > 1 && raw.endsWith('/') ? raw.slice(0, -1) : raw;
+  const collapsed =
+    raw.length > 1 && raw.endsWith('/') ? raw.slice(0, -1) : raw;
+
+  // Express route templates already use `:param` placeholders — leave them.
+  // Unmatched / fallback paths may contain real ids; bucket those.
+  if (req.route?.path) {
+    return collapsed.length > 1 && collapsed.endsWith('/')
+      ? collapsed.slice(0, -1)
+      : collapsed;
+  }
+
+  return normalizeRouteLabel(collapsed);
 }
 
 /**
