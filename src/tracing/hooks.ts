@@ -301,10 +301,19 @@ export class Tracer {
       return;
     }
 
+    let safeAttributes: Record<string, unknown> | undefined;
+    if (attributes !== undefined) {
+      try {
+        safeAttributes = sanitize(attributes);
+      } catch (err) {
+        safeAttributes = { error: 'sanitizer_failed' };
+      }
+    }
+
     const event: SpanEvent = {
       name,
       timestamp: Date.now(),
-      ...(attributes !== undefined ? { attributes: sanitize(attributes) } : {}),
+      ...(safeAttributes !== undefined ? { attributes: safeAttributes } : {}),
     };
 
     span.events.push(event);
@@ -503,10 +512,18 @@ export async function traceSpan<T>(
   parentSpanId?: string
 ): Promise<T> {
   const tracer = getTracer();
+  
+  let safeTags: Record<string, unknown> = {};
+  try {
+    safeTags = sanitize(tags) as Record<string, unknown>;
+  } catch (err) {
+    safeTags = { error: 'sanitizer_failed' };
+  }
+
   const startContext: Omit<SpanContext, 'spanId'> = {
     traceId: correlationId,
     serviceName: 'fluxora-api',
-    tags: { 'span.name': name, ...tags },
+    tags: { 'span.name': name, ...safeTags },
   };
   if (parentSpanId !== undefined) {
     startContext.parentSpanId = parentSpanId;

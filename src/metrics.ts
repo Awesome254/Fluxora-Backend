@@ -1,4 +1,43 @@
 import { Registry, collectDefaultMetrics, Counter, Histogram, Gauge } from 'prom-client';
+import { sanitize } from './pii/sanitizer.js';
+
+function sanitizeLabels(labelsOrValue: any): any {
+  if (typeof labelsOrValue === 'object' && labelsOrValue !== null) {
+    try {
+      return sanitize(labelsOrValue);
+    } catch {
+      // Fail closed: omit labels if sanitization fails
+      return {};
+    }
+  }
+  return labelsOrValue;
+}
+
+const originalCounterInc = Counter.prototype.inc;
+Counter.prototype.inc = function(labelsOrValue: any, value?: any) {
+  return originalCounterInc.call(this, sanitizeLabels(labelsOrValue), value);
+};
+
+const originalHistogramObserve = Histogram.prototype.observe;
+Histogram.prototype.observe = function(labelsOrValue: any, value?: any) {
+  return originalHistogramObserve.call(this, sanitizeLabels(labelsOrValue), value);
+};
+
+const originalGaugeSet = Gauge.prototype.set;
+Gauge.prototype.set = function(labelsOrValue: any, value?: any) {
+  return originalGaugeSet.call(this, sanitizeLabels(labelsOrValue), value);
+};
+
+const originalGaugeInc = Gauge.prototype.inc;
+Gauge.prototype.inc = function(labelsOrValue: any, value?: any) {
+  return originalGaugeInc.call(this, sanitizeLabels(labelsOrValue), value);
+};
+
+const originalGaugeDec = Gauge.prototype.dec;
+Gauge.prototype.dec = function(labelsOrValue: any, value?: any) {
+  return originalGaugeDec.call(this, sanitizeLabels(labelsOrValue), value);
+};
+
 
 /** Dedicated registry so default Node.js metrics don't leak into other registries. */
 export const registry = new Registry();

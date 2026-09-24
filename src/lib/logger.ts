@@ -30,9 +30,17 @@ export interface LogRecord {
 }
 
 function write(level: LogLevel, message: string, correlationId?: string, meta?: Record<string, unknown>): void {
-  // Sanitize the message and metadata
-  const sanitizedMessage = redactKeysInString(message);
-  const sanitizedMeta = meta ? sanitize(meta) : undefined;
+  let sanitizedMessage: string;
+  let sanitizedMeta: Record<string, unknown> | undefined;
+
+  try {
+    sanitizedMessage = redactKeysInString(message);
+    sanitizedMeta = meta ? sanitize(meta) : undefined;
+  } catch (err) {
+    // Fail closed if sanitization throws
+    sanitizedMessage = '[REDACTED DUE TO SANITIZER ERROR]';
+    sanitizedMeta = { error: 'sanitizer_failed' };
+  }
   
   const currentCorrelationId = correlationId ?? getCorrelationId();
 

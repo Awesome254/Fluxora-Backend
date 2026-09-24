@@ -10,7 +10,7 @@ import { dlqRouter } from './routes/dlq.js';
 import { authRouter } from './routes/auth.js';
 import { webhooksRouter, setInboundWebhookDedupCache } from './routes/webhooks.js';
 import { privacyRouter } from './routes/privacy.js';
-import { privacyHeaders } from './middleware/pii.js';
+import { privacyHeaders, responseSanitizer } from './middleware/pii.js';
 import type { Config } from './config/env.js';
 import { loadConfig, initializeConfig } from './config/env.js';
 import type { HealthCheckManager } from './config/health.js';
@@ -503,6 +503,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);
   app.use(requestLoggerMiddleware);
+  app.use(responseSanitizer);
   app.use(serverTimingMiddleware());
   app.use(httpMetrics);
   app.use(createDeprecationMiddleware(routeDeprecations));
