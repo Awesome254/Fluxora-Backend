@@ -141,7 +141,7 @@ function assertCallerScope(req: Request, ...required: string[]): void {
  * Root value object passed to `graphql()` — each key corresponds to a
  * field on the root `Query` type.
  */
-function createRootValue(_req: Request) {
+function createRootValue(req: Request) {
   return {
     /**
      * Fetch a single stream by ID.
@@ -275,7 +275,8 @@ export const graphqlGatewayRouter = Router();
 graphqlGatewayRouter.post(
   '/',
   authenticate,
-  requireAuth,
+  authenticateApiKey,
+  requireScope('streams:read', 'streams:write', 'audit:read'),
   async (req, res) => {
     const requestId = req.correlationId;
 
@@ -305,7 +306,17 @@ graphqlGatewayRouter.post(
           return;
         }
 
-        const { version, sha256Hash } = persistedQuery as { version?: unknown; sha256Hash?: unknown };
+        const persistedQuery = (extensions as Record<string, unknown>).persistedQuery;
+
+        if (persistedQuery !== undefined) {
+          if (typeof persistedQuery !== 'object' || persistedQuery === null || Array.isArray(persistedQuery)) {
+            res
+              .status(400)
+              .json(errorResponse('PERSISTED_QUERY_INVALID', 'Invalid persistedQuery extension.', undefined, requestId));
+            return;
+          }
+
+          const { version, sha256Hash } = persistedQuery as { version?: unknown; sha256Hash?: unknown };
 
         if (version !== 1) {
           res
@@ -391,88 +402,8 @@ graphqlGatewayRouter.post(
         return;
       }
 
-      // ── Execute query ───────────────────────────────────────────────────────
-      const rootValue = createRootValue(req);
-      const context = { req, res, requestId };
 
-      const result = await graphql({
-        schema: executableSchema,
-        source,
-        rootValue,
-        contextValue: context,
-        variableValues: variables ?? undefined,
-        operationName: operationName ?? undefined,
-      });
 
-      // ── Sanitise errors ─────────────────────────────────────────────────────
-      if (result.errors && result.errors.length > 0) {
-        result.errors = result.errors.map((err) => ({
-          ...err,
-          message: sanitiseGraphQLError(err.message),
-          ...(err.extensions
-            ? { extensions: sanitiseExtensions(err.extensions) }
-            : {}),
-        }) as unknown as GraphQLError);
-      }
-
-      res.json(result);
-    } catch (err) {
-      // Catch-all for internal errors that the graphql() call did not capture.
-      logger.error('GraphQL gateway unexpected error', requestId, {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      res.status(500).json({
-        errors: [
-          {
-            message: 'Internal server error',
-            extensions: { code: 'INTERNAL_ERROR' },
-          },
-        ],
-      });
-    }
-
-    // Static Query Enforcement (Your addition)
-    let document: DocumentNode;
-    try {
-      document = parse(source);
-    } catch (parseError) {
-      res
-        .status(400)
-        .json(
-          errorResponse(
-            'GRAPHQL_PARSE_ERROR',
-            'GraphQL query could not be parsed.',
-            undefined,
-            requestId
-          )
-        );
-      return;
-    }
-
-    if (isIntrospectionQuery(document)) {
-      rejectGraphQLError(res, 'INTROSPECTION_FORBIDDEN', 'GraphQL introspection is disabled.');
-      return;
-    }
-
-    const queryDepth = computeQueryDepth(document);
-    if (queryDepth > MAX_QUERY_DEPTH) {
-      rejectGraphQLError(
-        res,
-        'QUERY_TOO_DEEP',
-        `Query exceeds the maximum depth of ${MAX_QUERY_DEPTH}.`
-      );
-      return;
-    }
-
-    const queryComplexity = computeQueryComplexity(document);
-    if (queryComplexity > MAX_QUERY_COMPLEXITY) {
-      rejectGraphQLError(
-        res,
-        'QUERY_TOO_COMPLEX',
-        `Query exceeds the maximum complexity of ${MAX_QUERY_COMPLEXITY}.`
-      );
-      return;
-    }
 
     // Execute GraphQL Query
     const rootValue = createRootValue(req);
@@ -488,11 +419,20 @@ graphqlGatewayRouter.post(
     });
 
     if (result.errors && result.errors.length > 0) {
-      result.errors = result.errors.map((err) => ({
-        ...err,
-        message: sanitiseGraphQLError(err.message),
-        ...(err.extensions ? { extensions: sanitiseExtensions(err.extensions) } : {}),
-      })) as unknown as typeof result.errors;
+      result.errors = result.errors.map((err) => {
+        if ((err as { originalError?: unknown }).originalError instanceof GraphQLScopeDeniedError) {
+          return {
+            ...err,
+            message: 'Insufficient scopes to perform this operation',
+            extensions: { code: 'FORBIDDEN' },
+          } as unknown as GraphQLError;
+        }
+        return {
+          ...err,
+          message: sanitiseGraphQLError(err.message),
+          ...(err.extensions ? { extensions: sanitiseExtensions(err.extensions) } : {}),
+        } as unknown as GraphQLError;
+      });
     }
 
     res.json(result);
@@ -559,7 +499,8 @@ function sanitiseExtensions(
 graphqlGatewayRouter.get(
   '/',
   authenticate,
-  requireAuth,
+  authenticateApiKey,
+  requireScope('streams:read', 'streams:write', 'audit:read'),
   async (req, res) => {
     if (!isGraphQLGatewayEnabled(req)) {
       res.status(200).json({
