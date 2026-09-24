@@ -712,6 +712,7 @@ graphqlGatewayRouter.post(
     }
 
     // Static Query Enforcement
+    // Static Query Enforcement (Your addition)
     let document: DocumentNode;
     try {
       document = parse(source);
