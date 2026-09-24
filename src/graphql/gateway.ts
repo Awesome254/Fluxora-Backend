@@ -32,7 +32,7 @@
  */
 
 import { Router, type Request } from 'express';
-import { graphql, type GraphQLError } from 'graphql';
+import { graphql, type GraphQLError, parse, DocumentNode, isIntrospectionType, getNamedType } from 'graphql';
 import { createHash } from 'node:crypto';
 import { executableSchema, typeDefs } from './schema.js';
 import { isEnabled } from '../config/featureFlags.js';
@@ -53,6 +53,107 @@ const MAX_STREAM_PAGE_SIZE = 100;
 
 /** Maximum page size for audit-log pagination. */
 const MAX_AUDIT_PAGE_SIZE = 100;
+
+/** Maximum allowed GraphQL query depth. Prevents deeply-nested abuse. */
+const MAX_QUERY_DEPTH = 10;
+
+/** Maximum allowed GraphQL query complexity (field count). */
+const MAX_QUERY_COMPLEXITY = 100;
+
+/**
+ * Convenience alias: middleware that requires a valid, authenticated caller.
+ * Delegates to `requireScope` with an empty required-scope list so that any
+ * authenticated caller is accepted (scope checks happen per-resolver).
+ */
+const requireAuth = requireScope();
+
+/**
+ * Send a standardised GraphQL error envelope and end the response.
+ */
+function rejectGraphQLError(
+  res: import('express').Response,
+  code: string,
+  message: string,
+): void {
+  res.status(200).json({
+    errors: [{ message, extensions: { code } }],
+  });
+}
+
+/**
+ * Check whether a parsed GraphQL document is an introspection query.
+ * Introspection queries contain a field named `__schema` or `__type`.
+ */
+function isIntrospectionQuery(doc: DocumentNode): boolean {
+  for (const def of doc.definitions) {
+    if (def.kind !== 'OperationDefinition') continue;
+    for (const sel of def.selectionSet.selections) {
+      if (
+        sel.kind === 'Field' &&
+        (sel.name.value === '__schema' || sel.name.value === '__type')
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Compute the maximum nesting depth of a GraphQL document.
+ */
+function computeQueryDepth(doc: DocumentNode): number {
+  function selectionDepth(selections: readonly import('graphql').SelectionNode[]): number {
+    let max = 0;
+    for (const sel of selections) {
+      if (sel.kind === 'Field' && sel.selectionSet) {
+        max = Math.max(max, 1 + selectionDepth(sel.selectionSet.selections));
+      } else if (
+        (sel.kind === 'InlineFragment' || sel.kind === 'FragmentSpread') &&
+        'selectionSet' in sel &&
+        sel.selectionSet
+      ) {
+        max = Math.max(max, selectionDepth(sel.selectionSet.selections));
+      }
+    }
+    return max;
+  }
+  let max = 0;
+  for (const def of doc.definitions) {
+    if (def.kind === 'OperationDefinition') {
+      max = Math.max(max, selectionDepth(def.selectionSet.selections));
+    }
+  }
+  return max;
+}
+
+/**
+ * Estimate query complexity as the total number of field selections.
+ */
+function computeQueryComplexity(doc: DocumentNode): number {
+  function countSelections(selections: readonly import('graphql').SelectionNode[]): number {
+    let count = 0;
+    for (const sel of selections) {
+      if (sel.kind === 'Field') {
+        count += 1;
+        if (sel.selectionSet) count += countSelections(sel.selectionSet.selections);
+      } else if (
+        (sel.kind === 'InlineFragment') &&
+        sel.selectionSet
+      ) {
+        count += countSelections(sel.selectionSet.selections);
+      }
+    }
+    return count;
+  }
+  let total = 0;
+  for (const def of doc.definitions) {
+    if (def.kind === 'OperationDefinition') {
+      total += countSelections(def.selectionSet.selections);
+    }
+  }
+  return total;
+}
 
 // ── Persisted-query helpers ───────────────────────────────────────────────────
 
@@ -141,7 +242,7 @@ function assertCallerScope(req: Request, ...required: string[]): void {
  * Root value object passed to `graphql()` — each key corresponds to a
  * field on the root `Query` type.
  */
-function createRootValue(_req: Request) {
+function createRootValue(req: Request) {
   return {
     /**
      * Fetch a single stream by ID.
@@ -305,7 +406,7 @@ graphqlGatewayRouter.post(
           return;
         }
 
-        const { version, sha256Hash } = persistedQuery as { version?: unknown; sha256Hash?: unknown };
+        const { version, sha256Hash } = (extensions as Record<string, unknown>)['persistedQuery'] as { version?: unknown; sha256Hash?: unknown } ?? {};
 
         if (version !== 1) {
           res
@@ -375,23 +476,66 @@ graphqlGatewayRouter.post(
           source = cachedQuery;
         }
       }
-    }
 
-    if (!source || typeof source !== 'string') {
-      res
-        .status(400)
-        .json(
-          errorResponse(
-            'VALIDATION_ERROR',
-            'GraphQL request must include a "query" string field.',
-            undefined,
-            requestId
-          )
+      // ── Validate source ────────────────────────────────────────────────────
+      if (!source || typeof source !== 'string') {
+        res
+          .status(400)
+          .json(
+            errorResponse(
+              'VALIDATION_ERROR',
+              'GraphQL request must include a "query" string field.',
+              undefined,
+              requestId
+            )
+          );
+        return;
+      }
+
+      // ── Parse and enforce static query constraints ─────────────────────────
+      let document: DocumentNode;
+      try {
+        document = parse(source);
+      } catch (parseError) {
+        res
+          .status(400)
+          .json(
+            errorResponse(
+              'GRAPHQL_PARSE_ERROR',
+              'GraphQL query could not be parsed.',
+              undefined,
+              requestId
+            )
+          );
+        return;
+      }
+
+      if (isIntrospectionQuery(document)) {
+        rejectGraphQLError(res, 'INTROSPECTION_FORBIDDEN', 'GraphQL introspection is disabled.');
+        return;
+      }
+
+      const queryDepth = computeQueryDepth(document);
+      if (queryDepth > MAX_QUERY_DEPTH) {
+        rejectGraphQLError(
+          res,
+          'QUERY_TOO_DEEP',
+          `Query exceeds the maximum depth of ${MAX_QUERY_DEPTH}.`
         );
         return;
       }
 
-      // ── Execute query ───────────────────────────────────────────────────────
+      const queryComplexity = computeQueryComplexity(document);
+      if (queryComplexity > MAX_QUERY_COMPLEXITY) {
+        rejectGraphQLError(
+          res,
+          'QUERY_TOO_COMPLEX',
+          `Query exceeds the maximum complexity of ${MAX_QUERY_COMPLEXITY}.`
+        );
+        return;
+      }
+
+      // ── Execute query ────────────────────────────────────────────────────
       const rootValue = createRootValue(req);
       const context = { req, res, requestId };
 
@@ -404,15 +548,13 @@ graphqlGatewayRouter.post(
         operationName: operationName ?? undefined,
       });
 
-      // ── Sanitise errors ─────────────────────────────────────────────────────
+      // ── Sanitise errors ──────────────────────────────────────────────────
       if (result.errors && result.errors.length > 0) {
         result.errors = result.errors.map((err) => ({
           ...err,
           message: sanitiseGraphQLError(err.message),
-          ...(err.extensions
-            ? { extensions: sanitiseExtensions(err.extensions) }
-            : {}),
-        }) as unknown as GraphQLError);
+          ...(err.extensions ? { extensions: sanitiseExtensions(err.extensions) } : {}),
+        })) as unknown as typeof result.errors;
       }
 
       res.json(result);
@@ -430,88 +572,7 @@ graphqlGatewayRouter.post(
         ],
       });
     }
-
-    // Static Query Enforcement (Your addition)
-    let document: DocumentNode;
-    try {
-      document = parse(source);
-    } catch (parseError) {
-      res
-        .status(400)
-        .json(
-          errorResponse(
-            'GRAPHQL_PARSE_ERROR',
-            'GraphQL query could not be parsed.',
-            undefined,
-            requestId
-          )
-        );
-      return;
-    }
-
-    if (isIntrospectionQuery(document)) {
-      rejectGraphQLError(res, 'INTROSPECTION_FORBIDDEN', 'GraphQL introspection is disabled.');
-      return;
-    }
-
-    const queryDepth = computeQueryDepth(document);
-    if (queryDepth > MAX_QUERY_DEPTH) {
-      rejectGraphQLError(
-        res,
-        'QUERY_TOO_DEEP',
-        `Query exceeds the maximum depth of ${MAX_QUERY_DEPTH}.`
-      );
-      return;
-    }
-
-    const queryComplexity = computeQueryComplexity(document);
-    if (queryComplexity > MAX_QUERY_COMPLEXITY) {
-      rejectGraphQLError(
-        res,
-        'QUERY_TOO_COMPLEX',
-        `Query exceeds the maximum complexity of ${MAX_QUERY_COMPLEXITY}.`
-      );
-      return;
-    }
-
-    // Execute GraphQL Query
-    const rootValue = createRootValue(req);
-    const context = { req, res, requestId };
-
-    const result = await graphql({
-      schema: executableSchema,
-      source,
-      rootValue,
-      contextValue: context,
-      variableValues: variables ?? undefined,
-      operationName: operationName ?? undefined,
-    });
-
-    if (result.errors && result.errors.length > 0) {
-      result.errors = result.errors.map((err) => ({
-        ...err,
-        message: sanitiseGraphQLError(err.message),
-        ...(err.extensions ? { extensions: sanitiseExtensions(err.extensions) } : {}),
-      })) as unknown as typeof result.errors;
-    }
-
-    res.json(result);
-  } catch (err) {
-    logger.error('GraphQL gateway unexpected error', requestId, {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    res.status(500).json({
-      errors: [
-        {
-          message: 'Internal server error',
-          extensions: { code: 'INTERNAL_ERROR' },
-        },
-      ],
-    });
-  }
 });
-
-// ── Error sanitisation ─────────────────────────────────────────────────────────
 
 // ── Error sanitisation ─────────────────────────────────────────────────────────
 
