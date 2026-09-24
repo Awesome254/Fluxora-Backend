@@ -141,7 +141,7 @@ function assertCallerScope(req: Request, ...required: string[]): void {
  * Root value object passed to `graphql()` — each key corresponds to a
  * field on the root `Query` type.
  */
-function createRootValue(_req: Request) {
+function createRootValue(req: Request) {
   return {
     /**
      * Fetch a single stream by ID.
@@ -277,6 +277,7 @@ graphqlGatewayRouter.post(
   authenticate,
   authenticateApiKey,
   requireScope('streams:read'),
+  requireScope('streams:read', 'streams:write', 'audit:read'),
   async (req, res) => {
     const requestId = req.correlationId;
 
@@ -306,7 +307,17 @@ graphqlGatewayRouter.post(
           return;
         }
 
-        const { version, sha256Hash } = persistedQuery as { version?: unknown; sha256Hash?: unknown };
+        const persistedQuery = (extensions as Record<string, unknown>).persistedQuery;
+
+        if (persistedQuery !== undefined) {
+          if (typeof persistedQuery !== 'object' || persistedQuery === null || Array.isArray(persistedQuery)) {
+            res
+              .status(400)
+              .json(errorResponse('PERSISTED_QUERY_INVALID', 'Invalid persistedQuery extension.', undefined, requestId));
+            return;
+          }
+
+          const { version, sha256Hash } = persistedQuery as { version?: unknown; sha256Hash?: unknown };
 
         if (version !== 1) {
           res
@@ -392,18 +403,7 @@ graphqlGatewayRouter.post(
         return;
       }
 
-      // ── Execute query ───────────────────────────────────────────────────────
-      const rootValue = createRootValue(req);
-      const context = { req, res, requestId };
 
-      const result = await graphql({
-        schema: executableSchema,
-        source,
-        rootValue,
-        contextValue: context,
-        variableValues: variables ?? undefined,
-        operationName: operationName ?? undefined,
-      });
 
       // ── Sanitise errors ─────────────────────────────────────────────────────
       if (result.errors && result.errors.length > 0) {
@@ -431,6 +431,52 @@ graphqlGatewayRouter.post(
     }
   },
 );
+
+    // Execute GraphQL Query
+    const rootValue = createRootValue(req);
+    const context = { req, res, requestId };
+
+    const result = await graphql({
+      schema: executableSchema,
+      source,
+      rootValue,
+      contextValue: context,
+      variableValues: variables ?? undefined,
+      operationName: operationName ?? undefined,
+    });
+
+    if (result.errors && result.errors.length > 0) {
+      result.errors = result.errors.map((err) => {
+        if ((err as { originalError?: unknown }).originalError instanceof GraphQLScopeDeniedError) {
+          return {
+            ...err,
+            message: 'Insufficient scopes to perform this operation',
+            extensions: { code: 'FORBIDDEN' },
+          } as unknown as GraphQLError;
+        }
+        return {
+          ...err,
+          message: sanitiseGraphQLError(err.message),
+          ...(err.extensions ? { extensions: sanitiseExtensions(err.extensions) } : {}),
+        } as unknown as GraphQLError;
+      });
+    }
+
+    res.json(result);
+  } catch (err) {
+    logger.error('GraphQL gateway unexpected error', requestId, {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({
+      errors: [
+        {
+          message: 'Internal server error',
+          extensions: { code: 'INTERNAL_ERROR' },
+        },
+      ],
+    });
+  }
+});
 
 // ── Error sanitisation ─────────────────────────────────────────────────────────
 
@@ -482,6 +528,7 @@ graphqlGatewayRouter.get(
   authenticate,
   authenticateApiKey,
   requireScope('streams:read'),
+  requireScope('streams:read', 'streams:write', 'audit:read'),
   async (req, res) => {
     if (!isGraphQLGatewayEnabled(req)) {
       res.status(200).json({

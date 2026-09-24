@@ -142,8 +142,24 @@ rate(fluxora_db_query_errors_total[5m]) > 0
 ```
 
 ## Prometheus scrape configuration
+## Prometheus scrape configuration & Access Rules
 
-`GET /metrics` is protected by the same `ADMIN_API_KEY` Bearer token used by other admin routes. Prometheus scrape jobs must supply the token via the `Authorization` header.
+`GET /metrics` exposes internal operational metrics (traffic volumes, error rates, tenant counts, and component latencies) and is strictly protected from public access.
+
+### Authorization & Access Control
+- **Static Bearer Token**: `GET /metrics` requires a valid Bearer token matching the `ADMIN_API_KEY` environment variable (`Authorization: Bearer <ADMIN_API_KEY>`).
+- **JWT Authorization**: Requests carrying a signed JWT with the `admin` or `data-protection-officer` role are also authorized.
+- **Fail-Closed**: When `ADMIN_API_KEY` is not configured, the service fails closed and refuses all requests with `503 Service Unavailable`.
+- **Refusal & Logging**: Unauthenticated or unauthorized requests are refused immediately (401, 403, or 503) and logged as structured security warnings containing the request path, method, and client IP. No token or secret material is ever logged.
+
+### Network Interface & Internal Boundary
+In production deployments, the metrics endpoint must not be exposed to the public internet:
+- **Internal Interface Binding**: Ingress controllers, API gateways, or reverse proxies (such as Nginx, Traefik, or AWS ALB) must block external routing to `/metrics`.
+- **Private Scraping VPC**: Prometheus scrape jobs should access `/metrics` over internal VPC networks, private subnets, or dedicated management interfaces.
+
+### Cardinality & Privacy Guarantees
+- **No Per-User PII**: Metric labels are bounded to low-cardinality enum values (e.g. `method`, `route`, `status_code`, `outcome`, `status`, `reason`).
+- **No High-Cardinality User Identifiers**: Per-user identifiers, Stellar wallet addresses (`G...`), email addresses, user IDs, or API keys are strictly forbidden from metric label dimensions to prevent cardinality explosion and PII leakage in observability systems.
 
 ### Environment variable
 
@@ -165,12 +181,12 @@ scrape_configs:
 
 ### Response codes
 
-| Status | Cause |
-|--------|-------|
-| `200` | Valid token — metrics payload returned |
-| `401` | Missing or malformed `Authorization` header |
-| `403` | Token present but incorrect |
-| `503` | `ADMIN_API_KEY` not configured on the server |
+| Status | Cause | Logging |
+|--------|-------|---------|
+| `200` | Valid `ADMIN_API_KEY` or admin JWT token — metrics payload returned | Standard request log |
+| `401` | Missing or malformed `Authorization` header | Warning logged with path, method, client IP |
+| `403` | Token present but incorrect, or insufficient JWT role | Warning logged with path, method, client IP |
+| `503` | `ADMIN_API_KEY` not configured on the server | Warning logged with path, method, client IP |
 
 ## Runtime Performance Metrics
 

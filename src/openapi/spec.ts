@@ -1886,11 +1886,23 @@ registry.registerPath({
   method: 'get',
   path: '/metrics',
   summary: 'Prometheus metrics',
+  description:
+    'Returns Prometheus-format metrics for scraping. Protected by Bearer token authorization using ADMIN_API_KEY or an authorized JWT token with admin/data-protection-officer role. Unauthorised requests are refused and logged.',
   tags: ['observability'],
+  security: [{ bearerAuth: [] }],
   responses: {
     '200': {
       description: 'Prometheus text format',
       content: { 'text/plain': { schema: z.string() } },
+    },
+    '401': {
+      description: 'Unauthorized — missing or invalid Bearer authorization scheme/token',
+    },
+    '403': {
+      description: 'Forbidden — invalid admin credentials or insufficient role',
+    },
+    '503': {
+      description: 'Service Unavailable — admin API / ADMIN_API_KEY is not configured',
     },
   },
 });
