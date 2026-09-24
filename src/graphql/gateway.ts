@@ -275,7 +275,6 @@ export const graphqlGatewayRouter = Router();
 graphqlGatewayRouter.post(
   '/',
   authenticate,
-  requireAuth,
   async (req, res) => {
     const requestId = req.correlationId;
 
@@ -375,9 +374,8 @@ graphqlGatewayRouter.post(
           source = cachedQuery;
         }
       }
-    }
 
-    if (!source || typeof source !== 'string') {
+      if (!source || typeof source !== 'string') {
       res
         .status(400)
         .json(
@@ -430,86 +428,8 @@ graphqlGatewayRouter.post(
         ],
       });
     }
-
-    // Static Query Enforcement (Your addition)
-    let document: DocumentNode;
-    try {
-      document = parse(source);
-    } catch (parseError) {
-      res
-        .status(400)
-        .json(
-          errorResponse(
-            'GRAPHQL_PARSE_ERROR',
-            'GraphQL query could not be parsed.',
-            undefined,
-            requestId
-          )
-        );
-      return;
-    }
-
-    if (isIntrospectionQuery(document)) {
-      rejectGraphQLError(res, 'INTROSPECTION_FORBIDDEN', 'GraphQL introspection is disabled.');
-      return;
-    }
-
-    const queryDepth = computeQueryDepth(document);
-    if (queryDepth > MAX_QUERY_DEPTH) {
-      rejectGraphQLError(
-        res,
-        'QUERY_TOO_DEEP',
-        `Query exceeds the maximum depth of ${MAX_QUERY_DEPTH}.`
-      );
-      return;
-    }
-
-    const queryComplexity = computeQueryComplexity(document);
-    if (queryComplexity > MAX_QUERY_COMPLEXITY) {
-      rejectGraphQLError(
-        res,
-        'QUERY_TOO_COMPLEX',
-        `Query exceeds the maximum complexity of ${MAX_QUERY_COMPLEXITY}.`
-      );
-      return;
-    }
-
-    // Execute GraphQL Query
-    const rootValue = createRootValue(req);
-    const context = { req, res, requestId };
-
-    const result = await graphql({
-      schema: executableSchema,
-      source,
-      rootValue,
-      contextValue: context,
-      variableValues: variables ?? undefined,
-      operationName: operationName ?? undefined,
-    });
-
-    if (result.errors && result.errors.length > 0) {
-      result.errors = result.errors.map((err) => ({
-        ...err,
-        message: sanitiseGraphQLError(err.message),
-        ...(err.extensions ? { extensions: sanitiseExtensions(err.extensions) } : {}),
-      })) as unknown as typeof result.errors;
-    }
-
-    res.json(result);
-  } catch (err) {
-    logger.error('GraphQL gateway unexpected error', requestId, {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    res.status(500).json({
-      errors: [
-        {
-          message: 'Internal server error',
-          extensions: { code: 'INTERNAL_ERROR' },
-        },
-      ],
-    });
   }
-});
+);
 
 // ── Error sanitisation ─────────────────────────────────────────────────────────
 
@@ -559,7 +479,6 @@ function sanitiseExtensions(
 graphqlGatewayRouter.get(
   '/',
   authenticate,
-  requireAuth,
   async (req, res) => {
     if (!isGraphQLGatewayEnabled(req)) {
       res.status(200).json({
