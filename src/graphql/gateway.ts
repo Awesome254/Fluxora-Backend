@@ -43,6 +43,7 @@ import { createHash } from 'node:crypto';
 import { executableSchema, typeDefs } from './schema.js';
 import { isEnabled } from '../config/featureFlags.js';
 import { authenticate, requireAuth } from '../middleware/auth.js';
+import { authenticate, authenticateApiKey, requireScope, requireAuth } from '../middleware/auth.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { getAuditEntries } from '../lib/auditLog.js';
 import { errorResponse } from '../utils/response.js';
@@ -630,6 +631,11 @@ graphqlGatewayRouter.post(
       try {
         document = parse(source);
       } catch {
+      // ── Static query enforcement ────────────────────────────────────────────
+      let document: DocumentNode;
+      try {
+        document = parse(source);
+      } catch (parseError) {
         res
           .status(400)
           .json(
@@ -654,6 +660,16 @@ graphqlGatewayRouter.post(
           res,
           'QUERY_TOO_DEEP',
           `Query exceeds the maximum depth of ${MAX_QUERY_DEPTH}.`
+        );
+        return;
+      }
+
+      const queryComplexity = computeQueryComplexity(document);
+      if (queryComplexity > MAX_QUERY_COMPLEXITY) {
+        rejectGraphQLError(
+          res,
+          'QUERY_TOO_COMPLEX',
+          `Query exceeds the maximum complexity of ${MAX_QUERY_COMPLEXITY}.`
         );
         return;
       }
@@ -800,6 +816,7 @@ graphqlGatewayRouter.post(
     });
   }
 });
+  });
 
 // ── Error sanitisation ─────────────────────────────────────────────────────────
 
