@@ -296,6 +296,23 @@ webhooksRouter.get('/deliveries', (req, res) => {
  * List outbox items (for monitoring)
  */
 webhooksRouter.get('/outbox', (req, res) => {
+  // #1555: the outbox is an unbounded queue, so this listing is paginated
+  // (limit 1–100, default 100) instead of returning every item. The default
+  // keeps existing callers with ≤ 100 items seeing the same list.
+  const parsed = OffsetPaginationSchema.safeParse(req.query);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    res.status(400).json({
+      error: {
+        code: 'INVALID_PAGINATION',
+        message: first?.message ?? 'Invalid pagination parameters',
+      },
+    });
+    return;
+  }
+  const limit = parsed.data.limit ?? 100;
+  const offset = parsed.data.offset ?? 0;
+
   const { priority, status = 'ready' } = req.query;
 
   if (
@@ -326,9 +343,15 @@ webhooksRouter.get('/outbox', (req, res) => {
     items = items.filter((item) => item.attempts >= item.maxAttempts);
   }
 
+  const total = items.length;
+  const page = items.slice(offset, offset + limit);
+
   res.json({
-    total: items.length,
-    items: items.map((item) => ({
+    total,
+    limit,
+    offset,
+    has_more: offset + page.length < total,
+    items: page.map(item => ({
       id: item.id,
       deliveryId: item.deliveryId,
       eventId: item.eventId,
@@ -597,9 +620,9 @@ webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, 
   const contentType = req.header('content-type');
   const preflight = checkWebhookPreflight(req.body, contentType);
   if (!preflight.ok) {
-    res
-      .status(preflight.status)
-      .json(errorResponse(preflight.code as any, preflight.message, undefined, requestId));
+    res.status(preflight.status).json(
+      errorResponse(preflight.code, preflight.message, undefined, requestId)
+    );
     return;
   }
 
