@@ -392,8 +392,16 @@ async function wireIndexerLeaderElection(config: Config): Promise<void> {
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
   const env = options.env ?? (process.env as Record<string, string | undefined>);
-  const { trustProxy } = getRateLimitConfig(env);
-  app.set('trust proxy', trustProxy);
+  const { trustProxy, trustedProxyCount, trustedProxies } = getRateLimitConfig(env);
+  if (!trustProxy) {
+    app.set('trust proxy', false);
+  } else if (trustedProxyCount > 0) {
+    app.set('trust proxy', trustedProxyCount);
+  } else if (trustedProxies.size > 0) {
+    app.set('trust proxy', Array.from(trustedProxies));
+  } else {
+    app.set('trust proxy', 1);
+  }
   const rateLimiter = createRateLimiter(env);
 
   startRuntimeMetrics();
