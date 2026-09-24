@@ -69,18 +69,12 @@ const MAX_QUERY_COMPLEXITY = 15;
 
 // ── Persisted-query helpers ───────────────────────────────────────────────────
 
-/**
- * SHA-256 of a GraphQL query string. Persisted-query hashes let clients send
- * only the 64-char digest for expensive, pre-registered operations instead of
- * the full query text.
- */
 export function hashQuery(query: string): string {
   return createHash('sha256').update(query, 'utf8').digest('hex');
 }
 
 const persistedQueryStore = new Map<string, string>();
 
-/** Register a query for persisted-query transport and return its hash. */
 export function registerPersistedQuery(query: string): string {
   const hash = hashQuery(query);
   persistedQueryStore.set(hash, query);
@@ -238,25 +232,18 @@ function rejectGraphQLError(res: Response, code: string, message: string): void 
 
 // ── Resolver helpers ──────────────────────────────────────────────────────────
 
-/**
- * Resolve a feature-flag requester ID from the Express request.
- *
- * Uses the same strategy as REST routes: API-key record ID when available,
- * otherwise a synthetic identifier derived from the auth state.
- */
 function resolveRequesterId(req: Request): string {
-  // API-key callers authenticate via req.keyId; JWT callers via req.user.
-  if (req.keyId) return `key:${req.keyId}`;
-  if (req.user?.address) return `address:${req.user.address}`;
+  const user = (req as any).user;
+  if (user?.keyId) return `key:${user.keyId}`;
+  if (user?.address) return `address:${user.address}`;
   return 'anonymous';
 }
 
-/**
- * Check whether the GraphQL gateway is enabled for the current request.
- */
 export function isGraphQLGatewayEnabled(req: Request): boolean {
   return isEnabled(GRAPHQL_GATEWAY_FLAG, resolveRequesterId(req));
 }
+
+// ── Root value (resolvers) ────────────────────────────────────────────────────
 
 /**
  * Resolve the caller's effective scopes.
@@ -305,9 +292,6 @@ function assertCallerScope(req: Request, ...required: string[]): void {
  */
 function createRootValue(req: Request) {
   return {
-    /**
-     * Fetch a single stream by ID.
-     */
     async stream(args: { id: string }) {
       assertCallerScope(req, 'streams:read');
       const record = await streamRepository.getById(args.id);
@@ -315,9 +299,6 @@ function createRootValue(req: Request) {
       return mapStream(record);
     },
 
-    /**
-     * Paginated stream list with optional filters.
-     */
     async streams(args: {
       limit?: number;
       status?: string;
@@ -333,10 +314,10 @@ function createRootValue(req: Request) {
       if (args.contractId) filter.contract_id = args.contractId;
 
       const result = await streamRepository.findWithCursor(
-        filter as Parameters<typeof streamRepository.findWithCursor>[0],
+        filter as any,
         limit,
         args.afterId,
-        includeTotal,
+        includeTotal
       );
 
       return {
@@ -346,9 +327,6 @@ function createRootValue(req: Request) {
       };
     },
 
-    /**
-     * Query in-memory audit-log entries.
-     */
     auditEntries(args: { limit?: number; offset?: number; actionType?: string }) {
       assertCallerScope(req, 'audit:read');
       const limit = Math.min(Math.max(args.limit ?? 20, 1), MAX_AUDIT_PAGE_SIZE);
@@ -421,19 +399,6 @@ function mapStream(record: {
 
 export const graphqlGatewayRouter = Router();
 
-/**
- * POST /api/graphql
- *
- * Executes a GraphQL query against the schema.
- *
- * Authentication is required — requests without a valid Bearer token are
- * rejected with 401 before any GraphQL processing begins.
- *
- * When the `experimental_graphql_gateway` feature flag is disabled for the
- * caller, all queries return an error in the standard `errors` envelope
- * (HTTP 200 with `errors[0].message`), consistent with how feature-flagged
- * endpoints in the REST API behave.
- */
 graphqlGatewayRouter.post(
   '/',
   authenticate,
@@ -441,19 +406,46 @@ graphqlGatewayRouter.post(
   requireScope('streams:read'),
   requireScope('streams:read', 'streams:write', 'audit:read'),
   async (req, res) => {
-    const requestId = req.correlationId;
+  const requestId = (res.req as any)?.id ?? (req as any).correlationId;
+  const start = Date.now();
 
-    try {
-      // ── Feature-flag gate ──────────────────────────────────────────────────
-      if (!isGraphQLGatewayEnabled(req)) {
-        res.status(200).json({
-          errors: [
-            {
-              message: `Feature flag "${GRAPHQL_GATEWAY_FLAG}" is not enabled for this request.`,
-              extensions: { code: 'FEATURE_FLAG_DISABLED' },
-            },
-          ],
-        });
+  try {
+    if (!isGraphQLGatewayEnabled(req)) {
+      res.status(200).json({
+        errors: [
+          {
+            message: `Feature flag "${GRAPHQL_GATEWAY_FLAG}" is not enabled for this request.`,
+            extensions: { code: 'FEATURE_FLAG_DISABLED' },
+          },
+        ],
+      });
+      return;
+    }
+
+    const rawBody = req.body ?? {};
+    if (Array.isArray(rawBody)) {
+      res
+        .status(400)
+        .json(
+          errorResponse(
+            'VALIDATION_ERROR',
+            'Batch GraphQL operations are not allowed.',
+            undefined,
+            requestId
+          )
+        );
+      return;
+    }
+
+    const { query: queryText, variables, operationName, extensions } = rawBody;
+    let source: string | undefined = queryText;
+
+    // Persisted query resolution (Admin addition)
+    if (extensions !== undefined && extensions !== null) {
+      if (typeof extensions !== 'object' || Array.isArray(extensions)) {
+        res
+          .status(400)
+          .json(errorResponse('PERSISTED_QUERY_INVALID', 'Invalid extensions payload.', undefined, requestId));
         return;
       }
 
@@ -475,12 +467,11 @@ graphqlGatewayRouter.post(
 
       const { query: queryText, variables, operationName, extensions } = rawBody;
 
-      let source: string | undefined = queryText;
-
-      // ── Persisted-query extension ───────────────────────────────────────────
-      if (extensions !== undefined && extensions !== null) {
-        if (typeof extensions !== 'object' || Array.isArray(extensions)) {
-          res.status(400).json(errorResponse('PERSISTED_QUERY_INVALID', 'Invalid extensions payload.', undefined, requestId));
+      if (persistedQuery !== undefined) {
+        if (typeof persistedQuery !== 'object' || persistedQuery === null || Array.isArray(persistedQuery)) {
+          res
+            .status(400)
+            .json(errorResponse('PERSISTED_QUERY_INVALID', 'Invalid persistedQuery extension.', undefined, requestId));
           return;
         }
 
@@ -832,11 +823,6 @@ graphqlGatewayRouter.post(
 
 // ── Error sanitisation ─────────────────────────────────────────────────────────
 
-// ── Error sanitisation ─────────────────────────────────────────────────────────
-
-/**
- * Sanitise a GraphQL error message so internal details are never leaked.
- */
 function sanitiseGraphQLError(message: string): string {
   const sanitised = sanitiseErrorMessage(message)
     .replace(/\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+\.ts:\d+:\d+/g, '[redacted-path]')
@@ -858,11 +844,8 @@ function sanitiseGraphQLError(message: string): string {
   return sanitised;
 }
 
-/**
- * Sanitise error extensions — keep only known-safe codes.
- */
 function sanitiseExtensions(
-  extensions: Readonly<Record<string, unknown>>,
+  extensions: Readonly<Record<string, unknown>>
 ): Record<string, unknown> {
   const safe: Record<string, unknown> = {};
   if (typeof extensions.code === 'string') {
@@ -876,12 +859,8 @@ function sanitiseExtensions(
   return safe;
 }
 
-// ── GET handler — schema introspection for tooling ─────────────────────────────
+// ── GET handler ───────────────────────────────────────────────────────────────
 
-/**
- * GET /api/graphql?sdl — returns the raw SDL string for tooling (e.g. codegen).
- * Only available when the feature flag is enabled for the caller.
- */
 graphqlGatewayRouter.get(
   '/',
   authenticate,
@@ -889,30 +868,28 @@ graphqlGatewayRouter.get(
   requireScope('streams:read'),
   requireScope('streams:read', 'streams:write', 'audit:read'),
   async (req, res) => {
-    if (!isGraphQLGatewayEnabled(req)) {
-      res.status(200).json({
-        errors: [
-          {
-            message: `Feature flag "${GRAPHQL_GATEWAY_FLAG}" is not enabled for this request.`,
-            extensions: { code: 'FEATURE_FLAG_DISABLED' },
-          },
-        ],
-      });
-      return;
-    }
-
-    if (req.query.sdl !== undefined) {
-      res.type('text/plain').send(typeDefs);
-      return;
-    }
-
-    // Return a simple health/status response for GET without ?sdl
-    res.json({
-      data: {
-        __typename: 'GraphQLGateway',
-        version: '0.1.0',
-        status: 'experimental',
-      },
+  if (!isGraphQLGatewayEnabled(req)) {
+    res.status(200).json({
+      errors: [
+        {
+          message: `Feature flag "${GRAPHQL_GATEWAY_FLAG}" is not enabled for this request.`,
+          extensions: { code: 'FEATURE_FLAG_DISABLED' },
+        },
+      ],
     });
-  },
-);
+    return;
+  }
+
+  if (req.query.sdl !== undefined) {
+    res.type('text/plain').send(typeDefs);
+    return;
+  }
+
+  res.json({
+    data: {
+      __typename: 'GraphQLGateway',
+      version: '0.1.0',
+      status: 'experimental',
+    },
+  });
+});
