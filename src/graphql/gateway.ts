@@ -431,6 +431,62 @@ graphqlGatewayRouter.post(
     }
   },
 );
+    if (!source || typeof source !== 'string') {
+      res
+        .status(400)
+        .json(
+          errorResponse(
+            'VALIDATION_ERROR',
+            'GraphQL request must include a "query" string field.',
+            undefined,
+            requestId
+          )
+        );
+      return;
+    }
+
+    // Static Query Enforcement
+    let document: DocumentNode;
+    try {
+      document = parse(source);
+    } catch (parseError) {
+      res
+        .status(400)
+        .json(
+          errorResponse(
+            'GRAPHQL_PARSE_ERROR',
+            'GraphQL query could not be parsed.',
+            undefined,
+            requestId
+          )
+        );
+      return;
+    }
+
+    if (isIntrospectionQuery(document)) {
+      rejectGraphQLError(res, 'INTROSPECTION_FORBIDDEN', 'GraphQL introspection is disabled.');
+      return;
+    }
+
+    const queryDepth = computeQueryDepth(document);
+    if (queryDepth > MAX_QUERY_DEPTH) {
+      rejectGraphQLError(
+        res,
+        'QUERY_TOO_DEEP',
+        `Query exceeds the maximum depth of ${MAX_QUERY_DEPTH}.`
+      );
+      return;
+    }
+
+    const queryComplexity = computeQueryComplexity(document);
+    if (queryComplexity > MAX_QUERY_COMPLEXITY) {
+      rejectGraphQLError(
+        res,
+        'QUERY_TOO_COMPLEX',
+        `Query exceeds the maximum complexity of ${MAX_QUERY_COMPLEXITY}.`
+      );
+      return;
+    }
 
     // Execute GraphQL Query
     const rootValue = createRootValue(req);
