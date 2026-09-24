@@ -700,3 +700,9 @@ Hot-config refresh emits the following Prometheus series (no secret labels):
 | `fluxora_config_reload_generation` | Gauge | — | Last successfully applied generation |
 
 See also [env-reload-behavior.md](./env-reload-behavior.md).
+
+## Metric label cardinality
+
+See [metric-cardinality.md](./observability/metric-cardinality.md) for the
+policy that bounds Prometheus label values (no stream IDs, path parameters,
+or tenants as labels). Enforcement: `src/metrics/cardinality.ts`.
