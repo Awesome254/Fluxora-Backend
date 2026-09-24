@@ -660,6 +660,16 @@ graphqlGatewayRouter.post(
           res,
           'QUERY_TOO_DEEP',
           `Query exceeds the maximum depth of ${MAX_QUERY_DEPTH}.`
+      if (!source || typeof source !== 'string') {
+      res
+        .status(400)
+        .json(
+          errorResponse(
+            'VALIDATION_ERROR',
+            'GraphQL request must include a "query" string field.',
+            undefined,
+            requestId
+          )
         );
         return;
       }
@@ -817,6 +827,8 @@ graphqlGatewayRouter.post(
   }
 });
   });
+  }
+);
 
 // ── Error sanitisation ─────────────────────────────────────────────────────────
 
