@@ -514,6 +514,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);
   app.use(requestLoggerMiddleware);
+  app.use(responseSanitizer);
   app.use(serverTimingMiddleware());
   app.use(httpMetrics);
   app.use(createDeprecationMiddleware(routeDeprecations));
