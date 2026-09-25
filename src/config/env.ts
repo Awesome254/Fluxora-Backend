@@ -662,6 +662,8 @@ export interface Config {
   partnerApiToken?: string | undefined;
   requireAdminAuth: boolean;
   adminApiToken?: string | undefined;
+  /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
+  wsAuthRequired: boolean;
   sseMaxConnectionsPerIp: number;
   sseMaxConnectionsPerApiKey: number;
   sseMaxGlobalConnections: number;
@@ -899,6 +901,7 @@ function toConfig(env: ParsedEnv): Config {
     partnerApiToken: env.PARTNER_API_TOKEN,
     requireAdminAuth: env.REQUIRE_ADMIN_AUTH,
     adminApiToken: env.ADMIN_API_TOKEN,
+    wsAuthRequired: env.WS_AUTH_REQUIRED,
     sseMaxConnectionsPerIp: env.SSE_MAX_CONNECTIONS_PER_IP,
     sseMaxConnectionsPerApiKey: env.SSE_MAX_CONNECTIONS_PER_API_KEY,
     sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,
